@@ -1,0 +1,24 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: chatgpt2api:prod
+    container_name: chatgpt2api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:80"
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json
+    environment:
+      STORAGE_BACKEND: sqlite
+      DATABASE_URL: sqlite:////app/data/accounts.db
+    networks:
+      - default
+      - caddy
+
+networks:
+  caddy:
+    name: new-api_new-api-network
+    external: true
