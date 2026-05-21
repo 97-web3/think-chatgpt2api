@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# Sync local working tree to remote server `zzz` and (re)start the app.
+# Sync local working tree to remote server `zzz` (15.168.16.157, /home/think-chatgpt2api)
+# and (re)start the app via docker compose.
+#
+# IMPORTANT — when to use --rebuild:
+#   The Dockerfile COPYs source into the image (api/, services/, utils/, scripts/, web/,
+#   main.py, pyproject.toml, uv.lock). It does NOT bind-mount source. So any change to
+#   those files only takes effect after `docker compose build`. The only host-mounted
+#   paths are ./data and ./config.json — edits to those take effect on container restart.
+#
+#   Cheat sheet:
+#     - touched config.json only    → ./sync.sh && ssh zzz "docker restart chatgpt2api"
+#     - touched any source file     → ./sync.sh --rebuild   (REQUIRED, else stale code runs)
+#     - touched docker-compose.*    → ./sync.sh             (up -d recreates the container)
 #
 # Usage:
 #   ./sync.sh                rsync + docker compose up -d
 #   ./sync.sh --rebuild      rsync + docker compose build + up -d
-#                            use after any Python / web source change; -b is short form
+#                            REQUIRED after any Python / web source change; -b is short form
 #   ./sync.sh --dry-run      preview only
 #   ./sync.sh --no-restart   rsync only, skip docker compose (incompatible with --rebuild)
 #   ./sync.sh --delete       also delete remote files missing locally
@@ -45,7 +57,8 @@ for arg in "$@"; do
     --no-restart) NO_RESTART=1 ;;
     --rebuild|-b) REBUILD=1 ;;
     -h|--help)
-      sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+      # Print the top comment block (everything from line 2 until the first non-`#` line).
+      awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"
       exit 0 ;;
     *) echo "Unknown flag: $arg" >&2; exit 2 ;;
   esac

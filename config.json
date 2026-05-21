@@ -1,5 +1,5 @@
 {
-  "auth-key": "chatgpt2api",
+  "auth-key": "565a7a0cf118fab5277a3e743e839153910104cf860e42c6",
   "refresh_account_interval_minute": 60,
   "image_retention_days": 15,
   "image_poll_timeout_secs": 120,
@@ -12,7 +12,7 @@
     "warning"
   ],
   "proxy": "",
-  "base_url": "",
+  "base_url": "https://chatgpt2api.thinkai.tv",
   "sensitive_words": [],
   "global_system_prompt": "",
   "ai_review": {

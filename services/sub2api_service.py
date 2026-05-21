@@ -309,9 +309,8 @@ def list_remote_accounts(server: dict) -> list[dict]:
                 if not isinstance(account, dict):
                     continue
                 credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
-                access_token = _extract_access_token(credentials)
-                if not access_token:
-                    continue
+                # sub2api 的 list 接口不返回 access_token / refresh_token（敏感字段只在
+                # /api/v1/admin/accounts/{id} 详情接口返回），import 时按 id 单独抓取。
                 account_id = account.get("id")
                 items.append({
                     "id": str(account_id) if account_id is not None else _clean(credentials.get("chatgpt_account_id")),
@@ -320,7 +319,7 @@ def list_remote_accounts(server: dict) -> list[dict]:
                     "plan_type": _clean(credentials.get("plan_type")),
                     "status": _clean(account.get("status")),
                     "expires_at": _clean(credentials.get("expires_at")),
-                    "has_refresh_token": bool(_clean(credentials.get("refresh_token"))),
+                    "has_refresh_token": True,
                 })
 
             if page * 200 >= total or len(data) < 200:
@@ -388,26 +387,35 @@ def list_remote_groups(server: dict) -> list[dict]:
 
 
 def _fetch_access_token_for_account(server: dict, account_id: str) -> tuple[str, dict]:
-    """Return (access_token, account_meta) for a single sub2api account id."""
+    """Return (access_token, account_meta) for a single sub2api account id.
+
+    The per-account `/api/v1/admin/accounts/{id}` endpoint deliberately strips secrets.
+    The admin backup endpoint `/api/v1/admin/accounts/data?ids=<id>` returns the
+    `DataAccount` shape with raw `credentials` (the upstream comment explicitly states
+    this skips the dto.Account redaction path because it's a manager-initiated export).
+    """
     base_url = _clean(server.get("base_url"))
     headers = _auth_headers(server)
 
     session = Session(verify=True)
     try:
         response = session.get(
-            f"{base_url.rstrip('/')}/api/v1/admin/accounts/{account_id}",
+            f"{base_url.rstrip('/')}/api/v1/admin/accounts/data",
             headers=headers,
+            params={"ids": str(account_id), "include_proxies": "false"},
             timeout=30,
         )
         if not response.ok:
-            raise RuntimeError(f"HTTP {response.status_code}")
+            raise RuntimeError(f"HTTP {response.status_code} {response.text[:200]}")
         payload = response.json()
     finally:
         session.close()
 
-    account = _unwrap_envelope(payload)
-    if not isinstance(account, dict):
-        account = payload if isinstance(payload, dict) else {}
+    data = _unwrap_envelope(payload)
+    accounts = data.get("accounts") if isinstance(data, dict) else None
+    if not isinstance(accounts, list) or not accounts:
+        raise RuntimeError("account not found in export payload")
+    account = accounts[0]
     credentials = account.get("credentials") if isinstance(account.get("credentials"), dict) else {}
     access_token = _extract_access_token(credentials)
     if not access_token:
