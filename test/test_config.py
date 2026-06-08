@@ -58,6 +58,54 @@ class ConfigLoadingTests(unittest.TestCase):
                 else:
                     module.os.environ["CHATGPT2API_AUTH_KEY"] = old_env_auth_key
 
+    def test_normalize_image_storage_accepts_s3_mode(self) -> None:
+        module = self.config_module
+
+        settings = module._normalize_image_storage_settings({
+            "enabled": True,
+            "mode": "s3",
+            "s3_endpoint": " https://s3.example.test/ ",
+            "s3_region": "",
+            "s3_bucket": " bucket ",
+            "s3_access_key_id": " access ",
+            "s3_secret_access_key": " secret ",
+            "s3_prefix": " /images/generated/ ",
+            "public_base_url": " https://cdn.example.test/images/ ",
+        })
+
+        self.assertEqual(settings["mode"], "s3")
+        self.assertEqual(settings["s3_endpoint"], "https://s3.example.test")
+        self.assertEqual(settings["s3_region"], "auto")
+        self.assertEqual(settings["s3_bucket"], "bucket")
+        self.assertEqual(settings["s3_prefix"], "images/generated")
+        self.assertEqual(settings["public_base_url"], "https://cdn.example.test/images")
+
+    def test_validate_image_storage_requires_s3_credentials(self) -> None:
+        module = self.config_module
+        settings = module._normalize_image_storage_settings({
+            "enabled": True,
+            "mode": "s3",
+            "s3_endpoint": "https://s3.example.test",
+        })
+
+        with self.assertRaises(ValueError) as context:
+            module._validate_image_storage_settings(settings)
+
+        self.assertIn("Bucket", str(context.exception))
+        self.assertIn("Access Key ID", str(context.exception))
+        self.assertIn("Secret Access Key", str(context.exception))
+
+    def test_validate_both_mode_keeps_legacy_webdav_without_s3_fields(self) -> None:
+        module = self.config_module
+        settings = module._normalize_image_storage_settings({
+            "enabled": True,
+            "mode": "both",
+            "webdav_url": "https://dav.example.test",
+            "webdav_password": "secret",
+        })
+
+        module._validate_image_storage_settings(settings)
+
 
 if __name__ == "__main__":
     unittest.main()

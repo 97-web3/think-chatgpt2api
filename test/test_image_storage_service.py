@@ -41,6 +41,31 @@ class FakeWebDAVClient:
         return {"ok": True, "status": 200, "error": None}
 
 
+class FakeS3Client:
+    uploaded: dict[str, bytes] = {}
+    deleted: list[str] = []
+
+    def __init__(self, _settings):
+        pass
+
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
+        self.uploaded[rel] = payload
+        return f"https://s3.example.test/bucket/{rel}"
+
+    def get(self, rel: str) -> bytes:
+        return self.uploaded[rel]
+
+    def delete(self, rel: str) -> bool:
+        self.deleted.append(rel)
+        self.uploaded.pop(rel, None)
+        return True
+
+    def test(self) -> dict[str, object]:
+        self.put(".chatgpt2api_s3_test.txt", b"chatgpt2api s3 test\n", content_type="text/plain")
+        self.delete(".chatgpt2api_s3_test.txt")
+        return {"ok": True, "status": 200, "error": None}
+
+
 class ImageStorageServiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -54,6 +79,12 @@ class ImageStorageServiceTests(unittest.TestCase):
             "webdav_username": "",
             "webdav_password": "",
             "webdav_root_path": "chatgpt2api/images",
+            "s3_endpoint": "",
+            "s3_region": "auto",
+            "s3_bucket": "",
+            "s3_access_key_id": "",
+            "s3_secret_access_key": "",
+            "s3_prefix": "chatgpt2api/images",
             "public_base_url": "",
         }
         self.config_patcher = mock.patch("services.image_storage_service.config")
@@ -65,6 +96,8 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.mock_config.get_image_storage_settings.side_effect = lambda: dict(self.settings)
         FakeWebDAVClient.uploaded = {}
         FakeWebDAVClient.deleted = []
+        FakeS3Client.uploaded = {}
+        FakeS3Client.deleted = []
 
     def service(self) -> ImageStorageService:
         return ImageStorageService(self.data_dir / "image_index.json")
@@ -91,6 +124,26 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertFalse((self.images_dir / stored.rel).exists())
         self.assertIn(stored.rel, FakeWebDAVClient.uploaded)
         self.assertEqual(payload, FakeWebDAVClient.uploaded[stored.rel])
+
+    def test_s3_mode_uploads_without_local_file(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "s3",
+            "s3_endpoint": "https://s3.example.test",
+            "s3_bucket": "bucket",
+            "s3_access_key_id": "access-key",
+            "s3_secret_access_key": "secret",
+            "public_base_url": "https://cdn.example.test/images",
+        })
+        with mock.patch("services.image_storage_service.S3Client", FakeS3Client):
+            stored = self.service().save(png_bytes(), "http://app.test")
+            payload = self.service().get_bytes(stored.rel)
+
+        self.assertEqual(stored.storage, "s3")
+        self.assertFalse((self.images_dir / stored.rel).exists())
+        self.assertIn(stored.rel, FakeS3Client.uploaded)
+        self.assertEqual(payload, FakeS3Client.uploaded[stored.rel])
+        self.assertEqual(stored.url, f"https://cdn.example.test/images/{stored.rel}")
 
     def test_list_items_ignores_non_image_files(self):
         image = png_bytes()
@@ -121,6 +174,48 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertIn(stored.rel, FakeWebDAVClient.uploaded)
         self.assertEqual(stored.url, f"https://cdn.example.test/images/{stored.rel}")
 
+    def test_both_mode_prefers_s3_when_s3_fields_exist(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "both",
+            "s3_endpoint": "https://s3.example.test",
+            "s3_bucket": "bucket",
+            "s3_access_key_id": "access-key",
+            "s3_secret_access_key": "secret",
+            "webdav_url": "https://dav.example.test",
+            "webdav_password": "secret",
+        })
+        with mock.patch("services.image_storage_service.S3Client", FakeS3Client), mock.patch("services.image_storage_service.WebDAVClient", FakeWebDAVClient):
+            stored = self.service().save(png_bytes(), "http://app.test")
+
+        self.assertEqual(stored.storage, "both")
+        self.assertTrue((self.images_dir / stored.rel).is_file())
+        self.assertIn(stored.rel, FakeS3Client.uploaded)
+        self.assertNotIn(stored.rel, FakeWebDAVClient.uploaded)
+
+    def test_sync_all_uploads_local_images_to_s3(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "both",
+            "s3_endpoint": "https://s3.example.test",
+            "s3_bucket": "bucket",
+            "s3_access_key_id": "access-key",
+            "s3_secret_access_key": "secret",
+        })
+        image = png_bytes()
+        image_path = self.images_dir / "2026" / "05" / "07" / "sample.png"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        image_path.write_bytes(image)
+
+        with mock.patch("services.image_storage_service.S3Client", FakeS3Client):
+            result = self.service().sync_all()
+            items = self.service().list_items("http://app.test")
+
+        self.assertEqual(result, {"uploaded": 1, "skipped": 0, "failed": 0})
+        self.assertIn("2026/05/07/sample.png", FakeS3Client.uploaded)
+        self.assertEqual(items[0]["storage"], "both")
+        self.assertTrue(items[0]["s3"])
+
     def test_test_webdav_writes_and_deletes_probe_file(self):
         self.settings.update({
             "enabled": True,
@@ -133,6 +228,21 @@ class ImageStorageServiceTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn(".chatgpt2api_webdav_test.txt", FakeWebDAVClient.deleted)
+
+    def test_test_storage_dispatches_to_s3(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "s3",
+            "s3_endpoint": "https://s3.example.test",
+            "s3_bucket": "bucket",
+            "s3_access_key_id": "access-key",
+            "s3_secret_access_key": "secret",
+        })
+        with mock.patch("services.image_storage_service.S3Client", FakeS3Client):
+            result = self.service().test_storage()
+
+        self.assertTrue(result["ok"])
+        self.assertIn(".chatgpt2api_s3_test.txt", FakeS3Client.deleted)
 
 
 if __name__ == "__main__":

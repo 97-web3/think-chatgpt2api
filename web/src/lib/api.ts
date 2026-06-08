@@ -96,7 +96,7 @@ export type SettingsConfig = {
   [key: string]: unknown;
 };
 
-export type ImageStorageMode = "local" | "webdav" | "both";
+export type ImageStorageMode = "local" | "webdav" | "s3" | "both";
 
 export type ImageStorageSettings = {
   enabled: boolean;
@@ -105,6 +105,12 @@ export type ImageStorageSettings = {
   webdav_username: string;
   webdav_password: string;
   webdav_root_path: string;
+  s3_endpoint: string;
+  s3_region: string;
+  s3_bucket: string;
+  s3_access_key_id: string;
+  s3_secret_access_key: string;
+  s3_prefix: string;
   public_base_url: string;
 };
 
@@ -182,9 +188,10 @@ export type ManagedImage = {
   url: string;
   thumbnail_url?: string;
   created_at: string;
-  storage?: "local" | "webdav" | "both" | string;
+  storage?: "local" | "webdav" | "s3" | "both" | string;
   local?: boolean;
   webdav?: boolean;
+  s3?: boolean;
   width?: number;
   height?: number;
   tags?: string[];

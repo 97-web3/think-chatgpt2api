@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import io
 import json
 import time
@@ -8,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException
@@ -39,6 +40,14 @@ def _clean(value: object) -> str:
 
 def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sha256_hex(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _hmac_sha256(key: bytes, message: str) -> bytes:
+    return hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
 
 
 def _safe_relative_path(path: str) -> str:
@@ -164,6 +173,151 @@ class WebDAVClient:
             self.session.close()
 
 
+class S3Client:
+    def __init__(self, settings: dict[str, object]):
+        self.endpoint = _clean(settings.get("s3_endpoint")).rstrip("/")
+        self.region = _clean(settings.get("s3_region")) or "auto"
+        self.bucket = _clean(settings.get("s3_bucket"))
+        self.access_key_id = _clean(settings.get("s3_access_key_id"))
+        self.secret_access_key = _clean(settings.get("s3_secret_access_key"))
+        self.prefix = _clean(settings.get("s3_prefix")).strip("/")
+        self.session = requests.Session()
+
+    def validate(self) -> None:
+        missing = []
+        if not self.endpoint:
+            missing.append("S3 Endpoint")
+        if not self.bucket:
+            missing.append("Bucket")
+        if not self.access_key_id:
+            missing.append("Access Key ID")
+        if not self.secret_access_key:
+            missing.append("Secret Access Key")
+        if missing:
+            raise ImageStorageError(f"S3 配置不完整：缺少 {'、'.join(missing)}")
+        if urlparse(self.endpoint).scheme not in {"http", "https"}:
+            raise ImageStorageError("invalid S3 endpoint")
+
+    def object_key(self, rel: str) -> str:
+        parts = [part for part in [self.prefix, _safe_relative_path(rel)] if part]
+        return "/".join(part.strip("/") for part in parts if part.strip("/"))
+
+    def public_url(self, rel: str) -> str:
+        return f"{self.endpoint}/{quote(self.bucket, safe='')}/{quote(self.object_key(rel), safe='/')}"
+
+    def _aws_v4_headers(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: dict[str, str] | None = None,
+        body: bytes = b"",
+        extra_headers: dict[str, str] | None = None,
+    ) -> tuple[str, dict[str, str]]:
+        now = datetime.utcnow()
+        amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+        date_stamp = now.strftime("%Y%m%d")
+        encoded_query = urlencode(sorted((query or {}).items()))
+        payload_hash = _sha256_hex(body)
+        host = urlparse(self.endpoint).netloc
+        headers = {
+            "host": host,
+            "x-amz-content-sha256": payload_hash,
+            "x-amz-date": amz_date,
+        }
+        if extra_headers:
+            for key, value in extra_headers.items():
+                headers[key.lower()] = str(value).strip()
+        sorted_items = sorted((key.lower(), " ".join(str(value).strip().split())) for key, value in headers.items())
+        canonical_headers = "".join(f"{key}:{value}\n" for key, value in sorted_items)
+        signed_headers = ";".join(key for key, _ in sorted_items)
+        canonical_request = "\n".join([
+            method.upper(),
+            path,
+            encoded_query,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ])
+        credential_scope = f"{date_stamp}/{self.region}/s3/aws4_request"
+        string_to_sign = "\n".join([
+            "AWS4-HMAC-SHA256",
+            amz_date,
+            credential_scope,
+            _sha256_hex(canonical_request.encode("utf-8")),
+        ])
+        k_date = _hmac_sha256(("AWS4" + self.secret_access_key).encode("utf-8"), date_stamp)
+        k_region = hmac.new(k_date, self.region.encode("utf-8"), hashlib.sha256).digest()
+        k_service = hmac.new(k_region, b"s3", hashlib.sha256).digest()
+        k_signing = hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
+        signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+        request_headers = {key: value for key, value in headers.items()}
+        request_headers["authorization"] = (
+            "AWS4-HMAC-SHA256 "
+            f"Credential={self.access_key_id}/{credential_scope}, "
+            f"SignedHeaders={signed_headers}, "
+            f"Signature={signature}"
+        )
+        return encoded_query, request_headers
+
+    def _request(
+        self,
+        method: str,
+        rel: str = "",
+        *,
+        query: dict[str, str] | None = None,
+        body: bytes = b"",
+        extra_headers: dict[str, str] | None = None,
+        timeout: float = 60.0,
+    ):
+        self.validate()
+        path = f"/{quote(self.bucket, safe='')}"
+        if rel:
+            path += f"/{quote(self.object_key(rel), safe='/')}"
+        encoded_query, headers = self._aws_v4_headers(method, path, query=query, body=body, extra_headers=extra_headers)
+        url = f"{self.endpoint}{path}"
+        if encoded_query:
+            url += f"?{encoded_query}"
+        return self.session.request(method.upper(), url, headers=headers, data=body, timeout=timeout)
+
+    def put(self, rel: str, payload: bytes, content_type: str = "image/png") -> str:
+        headers = {
+            "content-type": content_type or "application/octet-stream",
+            "cache-control": "public, max-age=31536000, immutable",
+        }
+        response = self._request("PUT", rel, body=payload, extra_headers=headers)
+        if response.status_code >= 400:
+            raise ImageStorageError(f"S3 PUT failed: HTTP {response.status_code}")
+        return self.public_url(rel)
+
+    def get(self, rel: str) -> bytes:
+        response = self._request("GET", rel)
+        if response.status_code >= 400:
+            raise HTTPException(status_code=404, detail="image not found")
+        return bytes(response.content or b"")
+
+    def delete(self, rel: str) -> bool:
+        response = self._request("DELETE", rel, timeout=30.0)
+        if response.status_code in {200, 202, 204, 404}:
+            return response.status_code != 404
+        if response.status_code >= 400:
+            raise ImageStorageError(f"S3 DELETE failed: HTTP {response.status_code}")
+        return True
+
+    def test(self) -> dict[str, object]:
+        test_rel = ".chatgpt2api_s3_test.txt"
+        try:
+            self.put(test_rel, b"chatgpt2api s3 test\n", content_type="text/plain")
+            self.delete(test_rel)
+            return {"ok": True, "status": 200, "error": None}
+        except ImageStorageError as exc:
+            return {"ok": False, "status": 0, "error": str(exc)}
+        except Exception as exc:
+            return {"ok": False, "status": 0, "error": str(exc) or exc.__class__.__name__}
+        finally:
+            self.session.close()
+
+
 class ImageStorageService:
     def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
         self.index_file = index_file
@@ -174,6 +328,16 @@ class ImageStorageService:
 
     def mode(self) -> str:
         return _clean(self.settings().get("mode")) or "local"
+
+    def remote_backend(self) -> str:
+        settings = self.settings()
+        mode = self.mode()
+        has_s3 = any(_clean(settings.get(key)) for key in ("s3_endpoint", "s3_bucket", "s3_access_key_id", "s3_secret_access_key"))
+        if mode == "s3" or (mode == "both" and has_s3):
+            return "s3"
+        if mode == "webdav" or mode == "both":
+            return "webdav"
+        return ""
 
     def _load_index(self) -> dict[str, dict[str, object]]:
         raw = _read_json_object(self.index_file)
@@ -206,10 +370,12 @@ class ImageStorageService:
         config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
-        if mode not in {"local", "webdav", "both"}:
+        if mode not in {"local", "webdav", "s3", "both"}:
             mode = "local"
+        remote_backend = self.remote_backend()
         stored_local = False
         stored_webdav = False
+        stored_s3 = False
         remote_url = ""
 
         if mode in {"local", "both"}:
@@ -218,11 +384,15 @@ class ImageStorageService:
             path.write_bytes(image_data)
             stored_local = True
 
-        if mode in {"webdav", "both"}:
+        if remote_backend == "s3":
+            remote_url = S3Client(self.settings()).put(rel, image_data)
+            stored_s3 = True
+        elif remote_backend == "webdav":
             remote_url = WebDAVClient(self.settings()).put(rel, image_data)
             stored_webdav = True
 
         dimensions = _image_dimensions(image_data)
+        storage = "both" if stored_local and (stored_webdav or stored_s3) else ("s3" if stored_s3 else ("webdav" if stored_webdav else "local"))
         item = {
             "rel": rel,
             "path": rel,
@@ -230,9 +400,10 @@ class ImageStorageService:
             "date": "-".join(rel.split("/")[:3]),
             "size": len(image_data),
             "created_at": _now_iso(),
-            "storage": "both" if stored_local and stored_webdav else ("webdav" if stored_webdav else "local"),
+            "storage": storage,
             "local": stored_local,
             "webdav": stored_webdav,
+            "s3": stored_s3,
             "remote_url": remote_url,
         }
         if dimensions:
@@ -251,6 +422,8 @@ class ImageStorageService:
         if path.is_file():
             return path.read_bytes()
         item = self._load_clean_index().get(safe_rel, {})
+        if item.get("s3"):
+            return S3Client(self.settings()).get(safe_rel)
         if item.get("webdav"):
             return WebDAVClient(self.settings()).get(safe_rel)
         raise HTTPException(status_code=404, detail="image not found")
@@ -262,7 +435,7 @@ class ImageStorageService:
         if _local_image_path(safe_rel).is_file():
             return True
         item = self._load_clean_index().get(safe_rel, {})
-        return bool(item.get("webdav"))
+        return bool(item.get("webdav") or item.get("s3"))
 
     def has_local(self, rel: str) -> bool:
         safe_rel = _safe_relative_path(rel)
@@ -294,6 +467,7 @@ class ImageStorageService:
                     "storage": "local",
                     "local": True,
                     "webdav": False,
+                    "s3": False,
                     **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                 }
                 changed = True
@@ -306,15 +480,17 @@ class ImageStorageService:
                     continue
                 local = _local_image_path(rel).is_file()
                 webdav = bool(item.get("webdav"))
-                if not local and not webdav:
+                s3 = bool(item.get("s3"))
+                if not local and not webdav and not s3:
                     indexed.pop(rel, None)
                     changed = True
                     continue
-                storage = "both" if local and webdav else ("webdav" if webdav else "local")
-                if item.get("local") != local or item.get("storage") != storage:
+                storage = "both" if local and (webdav or s3) else ("s3" if s3 else ("webdav" if webdav else "local"))
+                if item.get("local") != local or item.get("storage") != storage or item.get("s3") != s3:
                     item = {
                         **item,
                         "local": local,
+                        "s3": s3,
                         "storage": storage,
                     }
                     indexed[rel] = item
@@ -345,6 +521,12 @@ class ImageStorageService:
         with self._index_lock:
             items = self._load_clean_index()
             item = items.get(safe_rel, {})
+            if item.get("s3"):
+                try:
+                    removed = S3Client(self.settings()).delete(safe_rel) or removed
+                except ImageStorageError:
+                    if not removed:
+                        raise
             if item.get("webdav"):
                 try:
                     removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
@@ -357,21 +539,22 @@ class ImageStorageService:
         return removed
 
     def sync_all(self) -> dict[str, int]:
+        remote_backend = self.remote_backend()
+        if remote_backend not in {"webdav", "s3"}:
+            raise ImageStorageError("远端图片存储未启用")
         settings = self.settings()
-        if self.mode() not in {"webdav", "both"}:
-            raise ImageStorageError("WebDAV 图片存储未启用")
         uploaded = 0
         skipped = 0
         failed = 0
         with self._index_lock:
             items = self._load_clean_index()
-            client = WebDAVClient(settings)
+            client = S3Client(settings) if remote_backend == "s3" else WebDAVClient(settings)
             for path in sorted(config.images_dir.rglob("*")):
                 if not path.is_file() or not _is_image_rel(path.name):
                     continue
                 rel = path.relative_to(config.images_dir).as_posix()
                 item = items.get(rel, {})
-                if item.get("webdav"):
+                if item.get(remote_backend):
                     skipped += 1
                     continue
                 try:
@@ -388,7 +571,8 @@ class ImageStorageService:
                         "created_at": str(item.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")),
                         "storage": "both",
                         "local": True,
-                        "webdav": True,
+                        "webdav": remote_backend == "webdav" or bool(item.get("webdav")),
+                        "s3": remote_backend == "s3" or bool(item.get("s3")),
                         "remote_url": remote_url,
                         **({"width": dimensions[0], "height": dimensions[1]} if dimensions else {}),
                     }
@@ -398,8 +582,14 @@ class ImageStorageService:
             self._save_index(items)
         return {"uploaded": uploaded, "skipped": skipped, "failed": failed}
 
-    def test_webdav(self) -> dict[str, object]:
+    def test_storage(self) -> dict[str, object]:
+        remote_backend = self.remote_backend()
+        if remote_backend == "s3":
+            return S3Client(self.settings()).test()
         return WebDAVClient(self.settings()).test()
+
+    def test_webdav(self) -> dict[str, object]:
+        return self.test_storage()
 
 
 image_storage_service = ImageStorageService()

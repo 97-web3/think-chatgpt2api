@@ -19,8 +19,11 @@ import { useAuthGuard } from "@/lib/use-auth-guard";
 const LONG_PRESS_MS = 800;
 
 function storageBadge(item: ManagedImage) {
-  if (item.local && item.webdav) {
+  if (item.local && (item.webdav || item.s3)) {
     return { label: "双端", className: "border-sky-200 bg-sky-50 text-sky-700" };
+  }
+  if (item.s3 || item.storage === "s3") {
+    return { label: "S3", className: "border-emerald-200 bg-emerald-50 text-emerald-700" };
   }
   if (item.webdav || item.storage === "webdav") {
     return { label: "WebDAV", className: "border-violet-200 bg-violet-50 text-violet-700" };
