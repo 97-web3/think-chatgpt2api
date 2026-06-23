@@ -8,6 +8,7 @@ from fastapi import HTTPException, Request
 from services.account_service import account_service
 from services.auth_service import auth_service
 from services.config import config
+from services.image_storage_service import image_storage_service
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 WEB_DIST_DIR = BASE_DIR / "web_dist"
@@ -94,6 +95,23 @@ def start_limited_account_watcher(stop_event: Event) -> Thread:
             stop_event.wait(interval_seconds)
 
     thread = Thread(target=worker, name="limited-account-watcher", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_image_cleanup_scheduler(stop_event: Event) -> Thread:
+    interval_seconds = 6 * 60 * 60
+
+    def worker() -> None:
+        while not stop_event.wait(interval_seconds):
+            try:
+                removed = image_storage_service.cleanup_expired_images()
+                if removed:
+                    print(f"[image-cleanup] removed {removed} expired images")
+            except Exception as exc:
+                print(f"[image-cleanup] fail {exc}")
+
+    thread = Thread(target=worker, name="image-cleanup-scheduler", daemon=True)
     thread.start()
     return thread
 

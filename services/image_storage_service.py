@@ -42,6 +42,16 @@ def _now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_timestamp(value: object) -> float | None:
+    text = _clean(value)
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _sha256_hex(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -366,8 +376,40 @@ class ImageStorageService:
         relative_dir = Path(time.strftime("%Y"), time.strftime("%m"), time.strftime("%d"))
         return f"{relative_dir.as_posix()}/{filename}"
 
+    def _created_timestamp(self, rel: str, item: dict[str, object]) -> float | None:
+        created = _parse_timestamp(item.get("created_at"))
+        if created is not None:
+            return created
+        parts = _safe_relative_path(rel).split("/")
+        if len(parts) >= 3:
+            try:
+                return datetime(int(parts[0]), int(parts[1]), int(parts[2])).timestamp()
+            except ValueError:
+                pass
+        path = _local_image_path(rel)
+        return path.stat().st_mtime if path.is_file() else None
+
+    def cleanup_expired_images(self) -> int:
+        retention_days = max(1, int(getattr(config, "image_retention_days", 30) or 30))
+        cutoff = time.time() - retention_days * 86400
+        expired: list[str] = []
+        with self._index_lock:
+            for rel, item in self._load_clean_index().items():
+                created_at = self._created_timestamp(rel, item)
+                if created_at is not None and created_at < cutoff:
+                    expired.append(rel)
+
+        removed = 0
+        for rel in expired:
+            try:
+                if self.delete(rel):
+                    removed += 1
+            except ImageStorageError:
+                continue
+        return removed + int(config.cleanup_old_images() or 0)
+
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        config.cleanup_old_images()
+        self.cleanup_expired_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "s3", "both"}:
@@ -522,17 +564,9 @@ class ImageStorageService:
             items = self._load_clean_index()
             item = items.get(safe_rel, {})
             if item.get("s3"):
-                try:
-                    removed = S3Client(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
+                removed = S3Client(self.settings()).delete(safe_rel) or removed
             if item.get("webdav"):
-                try:
-                    removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
-                except ImageStorageError:
-                    if not removed:
-                        raise
+                removed = WebDAVClient(self.settings()).delete(safe_rel) or removed
             if safe_rel in items:
                 items.pop(safe_rel, None)
                 self._save_index(items)

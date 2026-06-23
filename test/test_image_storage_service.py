@@ -92,6 +92,7 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.addCleanup(self.config_patcher.stop)
         self.mock_config.images_dir = self.images_dir
         self.mock_config.base_url = "http://app.test"
+        self.mock_config.image_retention_days = 30
         self.mock_config.cleanup_old_images.return_value = 0
         self.mock_config.get_image_storage_settings.side_effect = lambda: dict(self.settings)
         FakeWebDAVClient.uploaded = {}
@@ -215,6 +216,50 @@ class ImageStorageServiceTests(unittest.TestCase):
         self.assertIn("2026/05/07/sample.png", FakeS3Client.uploaded)
         self.assertEqual(items[0]["storage"], "both")
         self.assertTrue(items[0]["s3"])
+
+    def test_cleanup_expired_images_deletes_s3_object_and_index(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "s3",
+            "s3_endpoint": "https://s3.example.test",
+            "s3_bucket": "bucket",
+            "s3_access_key_id": "access-key",
+            "s3_secret_access_key": "secret",
+        })
+        service = self.service()
+        with mock.patch("services.image_storage_service.S3Client", FakeS3Client):
+            stored = service.save(png_bytes(), "http://app.test")
+            items = service._load_clean_index()
+            items[stored.rel] = {**items[stored.rel], "created_at": "2026-04-01 00:00:00"}
+            service._save_index(items)
+            removed = service.cleanup_expired_images()
+
+        self.assertEqual(removed, 1)
+        self.assertIn(stored.rel, FakeS3Client.deleted)
+        self.assertNotIn(stored.rel, service._load_clean_index())
+
+    def test_cleanup_expired_images_keeps_recent_s3_object(self):
+        self.settings.update({
+            "enabled": True,
+            "mode": "s3",
+            "s3_endpoint": "https://s3.example.test",
+            "s3_bucket": "bucket",
+            "s3_access_key_id": "access-key",
+            "s3_secret_access_key": "secret",
+        })
+        service = self.service()
+        with mock.patch("services.image_storage_service.S3Client", FakeS3Client):
+            stored = service.save(png_bytes(), "http://app.test")
+            removed = service.cleanup_expired_images()
+
+        self.assertEqual(removed, 0)
+        self.assertNotIn(stored.rel, FakeS3Client.deleted)
+        self.assertIn(stored.rel, service._load_clean_index())
+
+    def test_cleanup_expired_images_counts_legacy_local_cleanup(self):
+        self.mock_config.cleanup_old_images.return_value = 2
+
+        self.assertEqual(self.service().cleanup_expired_images(), 2)
 
     def test_test_webdav_writes_and_deletes_probe_file(self):
         self.settings.update({

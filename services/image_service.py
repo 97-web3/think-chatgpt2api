@@ -125,7 +125,7 @@ def cleanup_image_thumbnails() -> int:
     return removed
 
 def list_images(base_url: str, start_date: str = "", end_date: str = "") -> dict[str, object]:
-    config.cleanup_old_images()
+    image_storage_service.cleanup_expired_images()
     cleanup_image_thumbnails()
     all_tags = load_tags()
     items = [

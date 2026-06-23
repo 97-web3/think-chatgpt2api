@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sync local working tree to remote server `zzz` (15.168.16.157, /home/think-chatgpt2api)
+# Sync local working tree to the production server (/home/think-chatgpt2api)
 # and (re)start the app via docker compose.
 #
 # IMPORTANT — when to use --rebuild:
@@ -9,7 +9,7 @@
 #   paths are ./data and ./config.json — edits to those take effect on container restart.
 #
 #   Cheat sheet:
-#     - touched config.json only    → ./sync.sh && ssh zzz "docker restart chatgpt2api"
+#     - touched config.json only    → ./sync.sh && ssh -i /Users/aqin/.ssh/id_ed25519 -o IdentitiesOnly=yes root@15.168.58.179 "docker restart chatgpt2api"
 #     - touched any source file     → ./sync.sh --rebuild   (REQUIRED, else stale code runs)
 #     - touched docker-compose.*    → ./sync.sh             (up -d recreates the container)
 #
@@ -22,7 +22,8 @@
 #   ./sync.sh --delete       also delete remote files missing locally
 set -euo pipefail
 
-SERVER="zzz"
+SSH_TARGET="root@15.168.58.179"
+SSH_KEY="/Users/aqin/.ssh/id_ed25519"
 REMOTE_PATH="/home/think-chatgpt2api"
 COMPOSE_FILE="docker-compose.prod.yml"
 LOCAL_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -69,11 +70,12 @@ if [[ -n "$REBUILD" && -n "$NO_RESTART" ]]; then
   exit 2
 fi
 
-echo "==> rsync $LOCAL_PATH/ -> $SERVER:$REMOTE_PATH/ (compose: $COMPOSE_FILE)"
+echo "==> rsync $LOCAL_PATH/ -> $SSH_TARGET:$REMOTE_PATH/ (compose: $COMPOSE_FILE)"
 rsync -avzh --progress \
   $DRY $DELETE \
   "${EXCLUDES[@]}" \
-  "$LOCAL_PATH/" "$SERVER:$REMOTE_PATH/"
+  -e "ssh -i $SSH_KEY -o IdentitiesOnly=yes" \
+  "$LOCAL_PATH/" "$SSH_TARGET:$REMOTE_PATH/"
 
 if [[ -n "$DRY" ]]; then
   echo "==> dry-run, skipping docker compose"
@@ -86,10 +88,10 @@ fi
 
 if [[ -n "$REBUILD" ]]; then
   echo "==> docker compose -f $COMPOSE_FILE build  (~3-5min cold)"
-  ssh "$SERVER" "cd $REMOTE_PATH && docker compose -f $COMPOSE_FILE build"
+  ssh -i "$SSH_KEY" -o IdentitiesOnly=yes "$SSH_TARGET" "cd $REMOTE_PATH && docker compose -f $COMPOSE_FILE build"
 fi
 
 echo "==> docker compose -f $COMPOSE_FILE up -d"
-ssh "$SERVER" "cd $REMOTE_PATH && docker compose -f $COMPOSE_FILE up -d"
+ssh -i "$SSH_KEY" -o IdentitiesOnly=yes "$SSH_TARGET" "cd $REMOTE_PATH && docker compose -f $COMPOSE_FILE up -d"
 
 echo "==> done"
